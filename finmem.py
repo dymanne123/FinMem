@@ -37,6 +37,145 @@ try:
 except ImportError:
     print("Warning: sentence-transformers not installed.")
 
+# LLM-based memory extraction prompt
+MEMORY_EXTRACTION_PROMPT = """You are a financial memory analyzer. Analyze the following dialogue and extract structured memory information.
+
+DIALOGUE:
+{conversation}
+
+Analyze the dialogue and extract the following types of information. Return your analysis in JSON format:
+
+1. **User Preferences**: Extract expressed preferences, likes, dislikes, and stated requirements
+2. **Financial Goals**: Extract financial goals, plans, and objectives mentioned
+3. **Financial Information**: Extract specific financial details (amounts, accounts, investments, income, expenses)
+4. **Key Behaviors**: Extract spending habits, investment patterns, and financial behaviors
+5. **Important Constraints**: Extract budget limits, time constraints, or specific requirements
+
+Return JSON format:
+{{
+    "preferences": [
+        {{"content": "description of preference", "importance": "high/medium/low", "keywords": ["keyword1", "keyword2"]}}
+    ],
+    "goals": [
+        {{"content": "description of goal", "time_horizon": "short/medium/long", "importance": "high/medium/low"}}
+    ],
+    "financial_info": [
+        {{"content": "description of financial info", "type": "account/investment/income/expense", "amount": "specific amount if mentioned"}}
+    ],
+    "behaviors": [
+        {{"content": "description of behavior", "frequency": "recurring/occasional/one-time"}}
+    ],
+    "constraints": [
+        {{"content": "description of constraint", "type": "budget/time/risk"}}
+    ]
+}}
+
+If no information of a certain type is found, return an empty list for that category.
+
+DIALOGUE TO ANALYZE:
+{message}
+
+YOUR ANALYSIS (JSON ONLY):"""
+
+# Memory classification prompt for classifying existing memories
+MEMORY_CLASSIFICATION_PROMPT = """Classify the following memory content into one of these categories:
+- short_term: Recent transactions, expenses, or temporary information
+- long_term: Stable information, general knowledge, user profile facts
+- preference: User likes, dislikes, and stated preferences
+- behavior: Spending habits, investment patterns, recurring actions
+- goal: Financial goals, future plans, objectives
+
+Content to classify: "{content}"
+
+Speaker: {speaker}
+
+Return only the category name (one of: short_term, long_term, preference, behavior, goal):"""
+
+
+class LLMClient:
+    """LLM client wrapper for memory extraction"""
+    
+    def __init__(self, api_key: Optional[str] = None, base_url: str = "https://api.vveai.com/v1", 
+                 model: str = "gpt-4o-mini"):
+        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        self.base_url = base_url
+        self.model = model
+        self.client = None
+        if self.api_key:
+            try:
+                self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+            except Exception as e:
+                print(f"Warning: Failed to initialize LLM client: {e}")
+    
+    def extract_memories(self, message: str, conversation_context: str = "") -> Dict[str, Any]:
+        """Extract structured memories from a message using LLM"""
+        if not self.client:
+            return None
+        
+        try:
+            prompt = MEMORY_EXTRACTION_PROMPT.format(
+                conversation=conversation_context,
+                message=message
+            )
+            
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are a precise financial data analyst. Always return valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                max_tokens=1500
+            )
+            
+            result = response.choices[0].message.content.strip()
+            
+            # Try to parse JSON from response
+            # Handle potential markdown code blocks
+            if "```json" in result:
+                result = result.split("```json")[1].split("```")[0]
+            elif "```" in result:
+                result = result.split("```")[1].split("```")[0]
+            
+            return json.loads(result)
+        except Exception as e:
+            print(f"Error extracting memories with LLM: {e}")
+            return None
+    
+    def classify_memory(self, content: str, speaker: str = "user") -> str:
+        """Classify a memory into one of the predefined categories"""
+        if not self.client:
+            return "short_term"  # Default fallback
+        
+        try:
+            prompt = MEMORY_CLASSIFICATION_PROMPT.format(
+                content=content,
+                speaker=speaker
+            )
+            
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are a precise classifier. Return only the category name."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                max_tokens=50
+            )
+            
+            result = response.choices[0].message.content.strip().lower()
+            
+            # Validate the result
+            valid_categories = ["short_term", "long_term", "preference", "behavior", "goal"]
+            for cat in valid_categories:
+                if cat in result:
+                    return cat
+            
+            return "short_term"  # Default fallback
+        except Exception as e:
+            print(f"Error classifying memory: {e}")
+            return "short_term"
+
 
 # ==================== Data Structures ====================
 
@@ -151,34 +290,53 @@ class DialogueTurn:
     memory_retrieved: List[str] = field(default_factory=list)
 
 
-# ==================== Dialogue-Only Memory System ====================
+# ==================== Dialogue-Only Memory System (LLM-enhanced) ====================
 
 class DialogueOnlyMemorySystem:
     """
-    Memory system built purely from dialogue conversations.
+    Memory system built purely from dialogue conversations using LLM-based extraction.
     Does NOT use user persona or timeline - only extracts information from dialogues.
     
     This is designed for the scenario where user profile and timeline are not accessible,
     but we can still build useful memories from the conversation history.
+    
+    Uses LLM for intelligent memory extraction instead of keyword matching.
     """
     
     def __init__(
         self,
         embedding_model: str = 'all-MiniLM-L6-v2',
-        max_memories: int = 100
+        max_memories: int = 100,
+        llm_config: Optional[Dict[str, Any]] = None
     ):
         self.embedding_model = embedding_model
         self.max_memories = max_memories
+        
+        # LLM configuration for memory extraction
+        self.llm_config = llm_config or {
+            "api_key": os.environ.get("OPENAI_API_KEY"),
+            "base_url": "https://api.vveai.com/v1",
+            "model": "gpt-4o-mini"
+        }
+        
+        # Initialize LLM client
+        self.llm_client = LLMClient(
+            api_key=self.llm_config.get("api_key"),
+            base_url=self.llm_config.get("base_url", "https://api.vveai.com/v1"),
+            model=self.llm_config.get("model", "gpt-4o-mini")
+        )
         
         # Memory storage - organized by conversation context
         self.dialogue_memories: List[MemoryBlock] = []  # All dialogue-based memories
         self.short_term_memories: List[MemoryBlock] = []  # Recent conversation context
         self.long_term_memories: List[MemoryBlock] = []  # Important recurring info
         
-        # Extracted user information from dialogues
+        # Extracted user information from dialogues (LLM-extracted)
         self.extracted_preferences: List[MemoryBlock] = []  # User preferences mentioned
         self.extracted_financial_info: List[MemoryBlock] = []  # Financial details mentioned
         self.extracted_goals: List[MemoryBlock] = []  # Goals mentioned by user
+        self.extracted_behaviors: List[MemoryBlock] = []  # Behaviors and habits
+        self.extracted_constraints: List[MemoryBlock] = []  # Budget/time constraints
         
         # Embedding model for semantic search
         try:
@@ -191,33 +349,144 @@ class DialogueOnlyMemorySystem:
         # Conversation tracking
         self.conversation_turns: List[DialogueTurnInfo] = []
         self.current_session_id: Optional[str] = None
+        
+        # Batch processing settings
+        self._batch_size = 5  # Number of turns to accumulate before LLM extraction
+        self._pending_turns: List[DialogueTurnInfo] = []
     
     def add_dialogue_turn(
         self,
         turn: DialogueTurnInfo
     ):
-        """Add a dialogue turn and extract memories from it"""
+        """Add a dialogue turn and extract memories from it using LLM"""
         self.conversation_turns.append(turn)
+        self._pending_turns.append(turn)
         
-        # Extract information from this turn
-        self._extract_memory_from_turn(turn)
+        # Extract information from this turn using LLM
+        self._extract_memory_from_turn_llm(turn)
     
-    def _extract_memory_from_turn(self, turn: DialogueTurnInfo):
-        """Extract memory-worthy information from a dialogue turn"""
-        message = turn.message
+    def _extract_memory_from_turn_llm(self, turn: DialogueTurnInfo):
+        """Extract memory-worthy information from a dialogue turn using LLM"""
         
-        # Determine memory type based on speaker and content
+        # Prepare conversation context for LLM
+        context_turns = self.conversation_turns[-10:] if len(self.conversation_turns) > 10 else self.conversation_turns
+        conversation_context = "\n".join([
+            f"{'User' if t.speaker == 'user' else 'Assistant'}: {t.message}"
+            for t in context_turns[:-1]  # Exclude current turn
+        ])
+        
+        # Try LLM extraction first
+        if self.llm_client.client:
+            try:
+                result = self.llm_client.extract_memories(
+                    message=turn.message,
+                    conversation_context=conversation_context
+                )
+                
+                if result:
+                    self._process_llm_extracted_memories(result, turn)
+                    return
+            except Exception as e:
+                print(f"LLM extraction failed, falling back to keyword extraction: {e}")
+        
+        # Fallback to keyword-based extraction if LLM fails
+        self._extract_memory_from_turn_fallback(turn)
+    
+    def _process_llm_extracted_memories(self, result: Dict[str, Any], turn: DialogueTurnInfo):
+        """Process memory extraction results from LLM"""
+        timestamp = turn.timestamp or datetime.now().strftime("%Y%m%d%H%M")
+        
+        # Process preferences
+        for pref in result.get("preferences", []):
+            content = pref.get("content", "")
+            if content:
+                importance = {"high": 1.5, "medium": 1.2, "low": 1.0}.get(
+                    pref.get("importance", "medium"), 1.2
+                )
+                memory = MemoryBlock(
+                    memory_id=f"pref_{len(self.extracted_preferences)}_{turn.turn_number}",
+                    content=content,
+                    memory_type="preference",
+                    timestamp=timestamp,
+                    importance_score=importance,
+                    keywords=pref.get("keywords", self._extract_keywords(content))
+                )
+                self.extracted_preferences.append(memory)
+        
+        # Process goals
+        for goal in result.get("goals", []):
+            content = goal.get("content", "")
+            if content:
+                importance = {"high": 1.5, "medium": 1.2, "low": 1.0}.get(
+                    goal.get("importance", "medium"), 1.2
+                )
+                memory = MemoryBlock(
+                    memory_id=f"goal_{len(self.extracted_goals)}_{turn.turn_number}",
+                    content=content,
+                    memory_type="goal",
+                    timestamp=timestamp,
+                    importance_score=importance,
+                    keywords=self._extract_keywords(content)
+                )
+                self.extracted_goals.append(memory)
+        
+        # Process financial info
+        for fin_info in result.get("financial_info", []):
+            content = fin_info.get("content", "")
+            if content:
+                memory = MemoryBlock(
+                    memory_id=f"fin_{len(self.extracted_financial_info)}_{turn.turn_number}",
+                    content=content,
+                    memory_type="behavior",
+                    timestamp=timestamp,
+                    importance_score=1.3,
+                    keywords=self._extract_keywords(content)
+                )
+                self.extracted_financial_info.append(memory)
+        
+        # Process behaviors
+        for behavior in result.get("behaviors", []):
+            content = behavior.get("content", "")
+            if content:
+                memory = MemoryBlock(
+                    memory_id=f"beh_{len(self.extracted_behaviors)}_{turn.turn_number}",
+                    content=content,
+                    memory_type="behavior",
+                    timestamp=timestamp,
+                    importance_score=1.1,
+                    keywords=self._extract_keywords(content)
+                )
+                self.extracted_behaviors.append(memory)
+        
+        # Process constraints
+        for constraint in result.get("constraints", []):
+            content = constraint.get("content", "")
+            if content:
+                memory = MemoryBlock(
+                    memory_id=f"con_{len(self.extracted_constraints)}_{turn.turn_number}",
+                    content=content,
+                    memory_type="short_term",
+                    timestamp=timestamp,
+                    importance_score=1.2,
+                    keywords=self._extract_keywords(content)
+                )
+                self.extracted_constraints.append(memory)
+        
+        # For assistant responses, also store as dialogue memory
+        if turn.speaker == "assistant":
+            self._extract_assistant_info(turn)
+    
+    def _extract_memory_from_turn_fallback(self, turn: DialogueTurnInfo):
+        """Fallback to keyword-based extraction when LLM is unavailable"""
         if turn.speaker == "user":
-            # Extract user preferences, goals, questions from user messages
             self._extract_user_preferences(turn)
             self._extract_user_goals(turn)
             self._extract_financial_info(turn)
         else:
-            # Extract key advice/information from assistant responses
             self._extract_assistant_info(turn)
     
     def _extract_user_preferences(self, turn: DialogueTurnInfo):
-        """Extract user preference expressions from user messages"""
+        """Extract user preference expressions from user messages (keyword fallback)"""
         message = turn.message.lower()
         
         # Keywords indicating preferences
@@ -244,7 +513,7 @@ class DialogueOnlyMemorySystem:
                 break
     
     def _extract_user_goals(self, turn: DialogueTurnInfo):
-        """Extract financial goals from user messages"""
+        """Extract financial goals from user messages (keyword fallback)"""
         message = turn.message.lower()
         
         # Keywords indicating goals
@@ -268,7 +537,7 @@ class DialogueOnlyMemorySystem:
                 break
     
     def _extract_financial_info(self, turn: DialogueTurnInfo):
-        """Extract financial information (amounts, accounts, etc.) from messages"""
+        """Extract financial information (amounts, accounts, etc.) from messages (keyword fallback)"""
         message = turn.message
         
         # Look for financial amounts
@@ -1667,26 +1936,44 @@ Provide personalized, helpful financial advice considering the user's profile, g
         return self.memory.get_context_summary()
 
 
-# ==================== Dialogue-Only Agent ====================
+# ==================== Dialogue-Only Agent (LLM-enhanced) ====================
 
 class DialogueOnlyFinMemAgent:
     """
-    Financial Memory Agent that builds memory ONLY from dialogues.
+    Financial Memory Agent that builds memory ONLY from dialogues using LLM-based extraction.
     Does NOT use user persona or timeline - only extracts information from conversations.
     
     This is designed for scenarios where user profile and timeline are not accessible.
+    Uses LLM for intelligent memory extraction instead of keyword matching.
+    
+    Supports separate LLM models for:
+    - Memory extraction (extract memories from dialogues)
+    - Response generation (answer user queries)
     """
     
     def __init__(
         self,
         llm_config: Optional[Dict[str, Any]] = None,
+        memory_llm_config: Optional[Dict[str, Any]] = None,
         embedding_model: str = 'all-MiniLM-L6-v2',
         enable_skill_routing: bool = True,
         skill_version: Literal["v1", "v2"] = "v1"
     ):
-        # Initialize dialogue-only memory system
+        # LLM configuration for response generation
+        self.llm_config = llm_config or {
+            "provider": "openai",
+            "model": "gpt-4o-mini",
+            "api_key": os.environ.get("OPENAI_API_KEY"),
+            "base_url": "https://api.vveai.com/v1"
+        }
+        
+        # LLM configuration for memory extraction (can be different from main LLM)
+        self.memory_llm_config = memory_llm_config or self.llm_config
+        
+        # Initialize dialogue-only memory system with separate LLM config for memory extraction
         self.memory = DialogueOnlyMemorySystem(
-            embedding_model=embedding_model
+            embedding_model=embedding_model,
+            llm_config=self.memory_llm_config
         )
         
         # Initialize skill router (can be disabled)
@@ -1699,15 +1986,7 @@ class DialogueOnlyFinMemAgent:
             else:
                 self.router = FinancialSkillRouter()
         
-        # LLM configuration
-        self.llm_config = llm_config or {
-            "provider": "openai",
-            "model": "gpt-4o-mini",
-            "api_key": os.environ.get("OPENAI_API_KEY"),
-            "base_url": "https://api.vveai.com/v1"
-        }
-        
-        # Initialize LLM client
+        # Initialize LLM client for response generation
         if self.llm_config.get("api_key"):
             self.llm_client = OpenAI(
                 api_key=self.llm_config["api_key"],

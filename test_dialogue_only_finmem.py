@@ -249,6 +249,7 @@ class DialogueOnlyFinMemLLM:
     Wrapper class to use DialogueOnlyFinMemAgent in the test framework.
     
     This agent ONLY uses dialogue sessions to build memory - no user persona or timeline.
+    Uses LLM for memory extraction from dialogues.
     """
     
     def __init__(
@@ -282,6 +283,8 @@ class DialogueOnlyFinMemLLM:
         else:
             # Use DialogueOnlyFinMemAgent with memory
             self.no_memory_llm = None
+            
+            # LLM config for both response generation and memory extraction
             llm_config = {
                 "provider": "openai",
                 "model": model,
